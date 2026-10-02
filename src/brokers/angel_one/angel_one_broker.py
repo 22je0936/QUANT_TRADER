@@ -1,7 +1,8 @@
 """Angel One SmartAPI adapter. Implements IBrokerGateway + IMarketDataFeed so
 strategy/service/risk code never depends on SmartAPI directly.
 
-Requires the `smartapi-python` package (pip install smartapi-python pyotp) at
+Requires the `smartapi-python`, `pyotp`, and `logzero` packages (pip install
+-e '.[angel-one]') at
 runtime; imported lazily so the rest of the app works without it installed
 (e.g. when running only with the paper broker).
 """
@@ -50,6 +51,14 @@ _TRANSACTION_TYPE_MAP = {
 }
 
 
+
+
+
+
+
+
+
+#ADAPTERS
 class AngelOneBrokerAdapter(IBrokerGateway):
     """Order execution & account operations via Angel One SmartAPI."""
 
@@ -67,7 +76,7 @@ class AngelOneBrokerAdapter(IBrokerGateway):
             from SmartApi import SmartConnect
         except ImportError as exc:  # pragma: no cover - depends on optional dependency
             raise BrokerConnectionError(
-                "smartapi-python/pyotp not installed. Run: pip install smartapi-python pyotp"
+                "Angel One dependencies not installed. Run: pip install -e '.[angel-one]'"
             ) from exc
 
         try:
@@ -76,6 +85,7 @@ class AngelOneBrokerAdapter(IBrokerGateway):
             session = self._client.generateSession(self._client_id, self._password, totp)
             if not session.get("status"):
                 raise BrokerAuthenticationError(session.get("message", "Angel One login failed"))
+            
             logger.info("angel_one_connected", client_id=self._client_id)
         except BrokerAuthenticationError:
             raise
