@@ -21,6 +21,7 @@ src/brokers/base.py
 src/brokers/factory.py
 src/brokers/angel_one/__init__.py
 src/brokers/angel_one/angel_one_broker.py
+src/brokers/angel_one/arbitrage_feed.py
 src/brokers/kite/__init__.py
 src/brokers/kite/kite_broker.py
 src/brokers/paper/__init__.py
@@ -28,6 +29,7 @@ src/brokers/paper/paper_broker.py
 src/config/__init__.py
 src/config/settings.py
 src/core/__init__.py
+src/core/arbitrage_config.py
 src/core/entities.py
 src/core/exceptions.py
 src/core/interfaces.py

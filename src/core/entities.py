@@ -5,7 +5,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
+from typing import Literal
 from uuid import UUID, uuid4
+
+ExchangeName = Literal["NSE", "BSE"]
 
 
 class Exchange(str, Enum):
@@ -83,6 +86,32 @@ class Tick:
 
 
 @dataclass(frozen=True, slots=True)
+class MarketQuote:
+    """Validated best bid/ask market data used by broker-neutral strategies."""
+
+    symbol: str
+    exchange: ExchangeName
+    bid: Decimal
+    bid_quantity: int
+    ask: Decimal
+    ask_quantity: int
+    timestamp: datetime
+    raw_payload: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.symbol.strip():
+            raise ValueError("Market quote symbol must not be empty")
+        if self.exchange not in ("NSE", "BSE"):
+            raise ValueError(f"Unsupported exchange: {self.exchange}")
+        if self.timestamp.utcoffset() is None:
+            raise ValueError("Market quote timestamp must include a timezone")
+        if not self.bid.is_finite() or not self.ask.is_finite() or self.bid <= 0 or self.ask <= 0:
+            raise ValueError("Market quote bid and ask must be finite positive prices")
+        if self.bid_quantity < 0 or self.ask_quantity < 0:
+            raise ValueError("Market quote quantities must not be negative")
+
+
+@dataclass(frozen=True, slots=True)
 class Candle:
     instrument_id: str
     timeframe: str  # "1m", "5m", "15m", "1d"
@@ -103,6 +132,9 @@ class Order:
     quantity: int
     price: Decimal | None = None
     trigger_price: Decimal | None = None
+    exchange: Exchange | None = None
+    trading_symbol: str | None = None
+    symbol_token: str | None = None
     strategy_id: str | None = None
     client_order_id: str = field(default_factory=lambda: str(uuid4()))
     broker_order_id: str | None = None

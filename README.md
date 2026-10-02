@@ -125,6 +125,68 @@ Always start with `BROKER_PROVIDER=paper` for any new strategy.
 
 Run everything: `pytest`. Run a layer: `pytest tests/unit`.
 
+## Arbitrage Engine: Paper Default, Gated Live Mode
+
+The arbitrage watcher reads live NSE/BSE bid/ask depth, estimates transaction
+costs, applies quote freshness and risk checks, and records CSV ledgers. Paper
+mode is the default. A live limit-order path exists behind two environment
+gates but has only been tested with fake broker responses; it is not certified
+for live-market use. Angel One transport/order details are isolated under
+`src/brokers/angel_one/`; the engine, cost calculator, risk gate, paper/live
+execution orchestration, and CSV journal are under `strategy/arbitrage/`.
+
+### Setup and Run
+
+Use Python 3.11 or newer. Install the project and Angel One extra, then copy
+`.env.example` to `.env` and fill in the four `ANGEL_ONE_*` values. Do not
+commit `.env` or share its contents.
+
+The arbitrage environment defaults are `LIVE_TRADING_ENABLED=false`,
+`LIVE_TRADING_ACKNOWLEDGEMENT=` (blank),
+`ARBITRAGE_MAX_EXPOSURE_INR=300`, `ARBITRAGE_MAX_DAILY_LOSS_INR=60`, and
+`ARBITRAGE_MAX_FALLBACK_LOSS_INR=30`. These are software guardrails for the
+paper/live workflow, not a promise of safe or profitable trading. Live mode
+requires `LIVE_TRADING_ENABLED=true` plus the exact acknowledgement
+`LIVE_TRADING_ACKNOWLEDGEMENT=I_ACCEPT_LIVE_TRADING_RISK`. The live order path
+uses limit orders, polls/cancels through the Angel One order book, and blocks
+startup when prior live CSV records indicate unresolved orders/positions. It
+has not been verified against real Angel One responses or in a sandbox; do not
+assume it is ready for real-market trading.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e '.[angel-one,dev]'
+cp -n .env.example .env
+python strategy/arbitrage_watcher.py
+```
+
+Edit the watchlist and quote/risk limits in
+`strategy/arbitrage/config.py`. Transaction charge assumptions are injectable
+through `CostConfig` in `strategy/arbitrage/costs.py`; these estimates are not
+an exchange or broker fee guarantee.
+
+### Captured CSV Data
+
+The application creates `knowledge_base/` on startup and appends:
+
+- `market_quotes.csv`: timestamped NSE/BSE bid, ask, quantities, and raw feed
+  payload for every validated quote.
+- `opportunities.csv`: every detected opportunity, estimated charge breakdown,
+  net profit, and risk approval or rejection reason.
+- `paper_executions.csv`: simulated buy/sell prices, actual simulated exit
+  exchange, estimated costs, net P&L, fallback use, and any remaining open size.
+
+If the intended cross-exchange sell quote is stale or lacks enough displayed
+quantity, paper execution tries to close on the buy exchange at its current
+best bid. If that quote cannot close the position, the journal marks it
+`UNHEDGED` and logs an error instead of claiming a completed exit. This is a
+simulation rule, not a live order-management guarantee.
+
+Open the CSV files in a spreadsheet, or load them with pandas for analysis.
+The feed callback only parses, validates, journals, and queues quotes; spread
+calculations and risk/execution simulation run in the application loop.
+
 ## Migration Path: Angel One → Kite
 
 1. Implement `KiteBrokerAdapter` against the existing `IBrokerGateway` /

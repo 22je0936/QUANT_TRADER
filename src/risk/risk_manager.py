@@ -6,7 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 
-from src.core.entities import Order, Position
+from src.core.entities import Order, Position, TransactionType
 from src.core.exceptions import RiskLimitBreachedError
 from src.infra.logging import get_logger
 
@@ -76,5 +76,8 @@ class RiskManager:
         existing_qty = Decimal(existing.quantity) if existing else Decimal(0)
         existing_price = existing.average_price if existing else Decimal(0)
         price_hint = order.price or existing_price or Decimal(0)
-        projected_qty = existing_qty + Decimal(order.quantity)
+        signed_order_qty = Decimal(order.quantity)
+        if order.transaction_type == TransactionType.SELL:
+            signed_order_qty = -signed_order_qty
+        projected_qty = existing_qty + signed_order_qty
         return abs(projected_qty) * price_hint

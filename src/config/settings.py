@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from decimal import Decimal
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,6 +21,13 @@ class Settings(BaseSettings):
     angel_one_client_id: str = ""
     angel_one_password: str = ""
     angel_one_totp_secret: str = ""
+
+    # Arbitrage guardrails. Live execution is intentionally unsupported for now.
+    live_trading_enabled: bool = False
+    live_trading_acknowledgement: str = ""
+    arbitrage_max_exposure_inr: Decimal = Decimal("300")
+    arbitrage_max_daily_loss_inr: Decimal = Decimal("60")
+    arbitrage_max_fallback_loss_inr: Decimal = Decimal("30")
 
     # Kite
     kite_api_key: str = ""

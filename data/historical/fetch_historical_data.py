@@ -28,7 +28,16 @@ from src.config.settings import get_settings  # noqa: E402
 SCRIP_FILE = ROOT / "data" / "share_response.json"
 DEFAULT_SYMBOLS = ("RELIANCE", "KOTAKBANK")
 EXCHANGES = ("NSE", "BSE")
-INTERVALS = ("ONE_MINUTE", "THREE_MINUTE", "FIVE_MINUTE", "FIFTEEN_MINUTE", "ONE_DAY")
+INTERVALS = (
+    "ONE_MINUTE",
+    "THREE_MINUTE",
+    "FIVE_MINUTE",
+    "TEN_MINUTE",
+    "FIFTEEN_MINUTE",
+    "THIRTY_MINUTE",
+    "ONE_HOUR",
+    "ONE_DAY",
+)
 
 
 def load_instruments(

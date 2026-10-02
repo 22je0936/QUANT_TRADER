@@ -1,120 +1,281 @@
-"""WebSocket lifecycle and wiring for the arbitrage watcher."""
+"""Application wiring for the paper-only arbitrage workflow."""
 
 from __future__ import annotations
 
-import time
-from typing import Any
+import signal
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from queue import Empty, Queue
+from threading import Event
+from typing import NoReturn
+from zoneinfo import ZoneInfo
 
+from src.brokers.angel_one.angel_one_broker import AngelOneBrokerAdapter
+from src.brokers.angel_one.arbitrage_feed import AngelOneArbitrageFeed
 from src.config.settings import get_settings
-from src.core.arbitrage_config import EXCHANGES, EXCH_TYPE, Config
+from src.infra.logging import configure_logging, get_logger
+from src.risk.risk_manager import RiskLimits, RiskManager, RiskState
 
-from .execution import AngelOneOrderExecutor
-from .instruments import InstrumentCatalog, load_instruments
-from .signals import ArbitrageSignal, ArbitrageSignalEngine, parse_quote
+from .config import ArbitrageConfig
+from .costs import CostCalculator
+from .engine import ArbitrageEngine
+from .instruments import load_instruments
+from .live_execution import LiveArbitrageExecutor
+from .models import MarketQuote
+from .paper_execution import PaperExecutor
+from .risk import OpportunityRiskManager
+from .storage import CsvJournal
+
+logger = get_logger(__name__)
 
 
-class ArbitrageWatcher:
-    """Connect market data to the signal engine and optional order executor."""
+@dataclass(frozen=True, slots=True)
+class FeedFailure:
+    error: Exception
 
-    def __init__(self, config: Config | None = None) -> None:
-        self.config = config or Config()
-        self.catalog: InstrumentCatalog | None = None
-        self.signal_engine = ArbitrageSignalEngine(self.config)
-        self.order_executor = AngelOneOrderExecutor(self.config)
-        self.websocket: Any = None
 
-    def on_data(self, _websocket: Any, message: dict[str, Any]) -> None:
-        if self.catalog is None:
-            return
+class ArbitrageApplication:
+    """Queue quotes from the feed; perform detection, risk, and paper fills here."""
 
-        token = str(message.get("token", "")).strip('"')
-        exchange_type = message.get("exchange_type")
-        if exchange_type is None:
-            return
-        instrument_key = self.catalog.by_token.get((int(exchange_type), token))
-        if instrument_key is None:
-            return
-
-        name, exchange = instrument_key
-        quote = parse_quote(message)
-        if quote is None:
-            return
-        signal = self.signal_engine.update_quote(name, exchange, quote)
-        if signal is not None:
-            self._handle_signal(signal)
-
-    def _handle_signal(self, signal: ArbitrageSignal) -> None:
-        print(
-            f"\n*** ARBITRAGE {signal.name} ***\n"
-            f"   BUY  on {signal.buy_exchange} @ {signal.buy_price:.2f}\n"
-            f"   SELL on {signal.sell_exchange} @ {signal.sell_price:.2f}\n"
-            f"   spread {signal.spread:.2f} ({signal.spread_pct:.3f}%)  "
-            f"available qty {signal.quantity if signal.quantity is not None else 'n/a'}"
+    def __init__(self, config: ArbitrageConfig | None = None) -> None:
+        settings = get_settings()
+        base_config = config or ArbitrageConfig()
+        self.config = replace(
+            base_config,
+            max_order_notional=min(
+                base_config.max_order_notional, settings.arbitrage_max_exposure_inr
+            ),
+            max_daily_loss=min(base_config.max_daily_loss, settings.arbitrage_max_daily_loss_inr),
+            max_fallback_loss=min(
+                base_config.max_fallback_loss, settings.arbitrage_max_fallback_loss_inr
+            ),
         )
-        if not self.config.place_orders:
-            return
-
-        quantity = self.config.order_qty
-        if signal.quantity is not None:
-            quantity = min(quantity, signal.quantity)
-        instruments = self.catalog.by_name[signal.name]
-        self.order_executor.place_order(
-            instruments[signal.buy_exchange], "BUY", signal.buy_price, quantity
-        )
-        self.order_executor.place_order(
-            instruments[signal.sell_exchange], "SELL", signal.sell_price, quantity
-        )
+        self._settings = settings
+        self._events: Queue[MarketQuote | FeedFailure] = Queue()
+        self._stop_event = Event()
+        self._journal = CsvJournal(self.config.knowledge_base)
+        self._costs = CostCalculator(self.config.costs)
+        self._engine = ArbitrageEngine(self.config, self._costs)
+        self._risk = OpportunityRiskManager(self.config)
+        self._paper_executor = PaperExecutor(self.config, self._costs)
+        self._live_executor: LiveArbitrageExecutor | None = None
+        self._catalog = None
 
     def run(self) -> None:
-        from SmartApi.smartWebSocketV2 import SmartWebSocketV2
+        configure_logging()
+        if self._settings.live_trading_enabled:
+            acknowledgement = "I_ACCEPT_LIVE_TRADING_RISK"
+            if self._settings.live_trading_acknowledgement != acknowledgement:
+                raise RuntimeError(
+                    "Live trading is fail-closed. Set LIVE_TRADING_ACKNOWLEDGEMENT="
+                    f"{acknowledgement} only after reviewing the live-risk documentation."
+                )
 
-        self.catalog = load_instruments(self.config.scrip_file, self.config.watchlist)
-        for name in self.catalog.missing_names:
-            print(f"[skip] {name}: missing NSE or BSE scrip")
-        for name, instruments in self.catalog.by_name.items():
-            nse, bse = instruments["NSE"], instruments["BSE"]
-            print(f"[ok] {name}: NSE {nse.symbol}/{nse.token}  BSE {bse.symbol}/{bse.token}")
-        if not self.catalog.by_name:
-            raise SystemExit("No stocks found on both NSE and BSE.")
+        catalog = load_instruments(self.config.scrip_file, self.config.symbols)
+        for symbol in catalog.missing_names:
+            logger.warning(
+                "arbitrage_symbol_skipped", symbol=symbol, reason="missing exchange listing"
+            )
+        if not catalog.by_name:
+            raise RuntimeError("No configured symbol has both an NSE and BSE listing")
+        self._catalog = catalog
 
-        settings = get_settings()
-        auth_token, feed_token = self.order_executor.connect(settings)
-        self.websocket = SmartWebSocketV2(
-            auth_token,
-            settings.angel_one_api_key,
-            settings.angel_one_client_id,
-            feed_token,
-            max_retry_attempt=5,
+        live_broker: AngelOneBrokerAdapter | None = None
+        if self._settings.live_trading_enabled:
+            self._journal.ensure_live_state_reconciled()
+            market_date = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+            daily_pnl = self._journal.get_live_daily_pnl(market_date)
+            risk_state = RiskState(realized_pnl_today=daily_pnl)
+            if daily_pnl <= -self.config.max_daily_loss:
+                risk_state.kill_switch_engaged = True
+            live_risk_manager = RiskManager(
+                RiskLimits(
+                    max_daily_loss=self.config.max_daily_loss,
+                    max_position_size=self.config.max_order_notional,
+                    max_order_quantity=self.config.paper_quantity,
+                    max_exposure_per_symbol=self.config.max_order_notional,
+                ),
+                state=risk_state,
+            )
+            if live_risk_manager.state.kill_switch_engaged:
+                raise RuntimeError("Persisted live daily loss has reached the configured limit")
+            live_broker = AngelOneBrokerAdapter(
+                self._settings.angel_one_api_key,
+                self._settings.angel_one_client_id,
+                self._settings.angel_one_password,
+                self._settings.angel_one_totp_secret,
+            )
+            try:
+                live_broker.connect()
+                open_orders = live_broker.get_open_orders()
+                if open_orders:
+                    raise RuntimeError(
+                        "Live arbitrage requires no pre-existing open Angel One orders; "
+                        "reconcile the broker order book first"
+                    )
+                active_positions = [
+                    position
+                    for position in live_broker.get_positions()
+                    if position.quantity != 0
+                ]
+                if active_positions:
+                    raise RuntimeError(
+                        "Live arbitrage requires a flat Angel One account; "
+                        "close/reconcile existing positions first"
+                    )
+                self._live_executor = LiveArbitrageExecutor(
+                    live_broker,
+                    live_risk_manager,
+                    self.config,
+                    self._costs,
+                    self._journal,
+                    lambda symbol: self._engine.latest_quotes.get(symbol, {}),
+                )
+            except Exception:
+                try:
+                    live_broker.disconnect()
+                except Exception:
+                    logger.exception("live_preflight_disconnect_failed")
+                raise
+
+        feed = AngelOneArbitrageFeed(
+            self._settings.angel_one_api_key,
+            self._settings.angel_one_client_id,
+            self._settings.angel_one_password,
+            self._settings.angel_one_totp_secret,
+            catalog.by_token,
+            self._receive_quote,
+            self._receive_feed_failure,
+            self.config.reconnect_initial_delay,
+            self.config.reconnect_max_delay,
+            broker=live_broker,
         )
-        token_list = [
-            {
-                "exchangeType": EXCH_TYPE[exchange],
-                "tokens": [
-                    instruments[exchange].token for instruments in self.catalog.by_name.values()
-                ],
-            }
-            for exchange in EXCHANGES
-        ]
-
-        def on_open(_websocket: Any) -> None:
-            print("WebSocket connected. Subscribing...")
-            self.websocket.subscribe("arb_watch", 3, token_list)
-
-        self.websocket.on_open = on_open
-        self.websocket.on_data = self.on_data
-        self.websocket.on_error = lambda _ws, error: print("WS error:", error)
-        self.websocket.on_close = lambda _ws: print("WS closed")
-
-        print(f"Watching {len(self.catalog.by_name)} stocks on NSE + BSE. Ctrl+C to stop.")
+        previous_handlers = self._install_shutdown_handlers()
+        logger.info(
+            "arbitrage_engine_starting",
+            symbols=len(catalog.by_name),
+            knowledge_base=str(self.config.knowledge_base),
+            mode="live" if self._settings.live_trading_enabled else "paper",
+            real_orders_enabled=self._settings.live_trading_enabled,
+        )
         try:
-            self.websocket.connect()
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("\nStopping...")
+            feed.start()
+            while not self._stop_event.is_set():
+                try:
+                    event = self._events.get(timeout=0.25)
+                except Empty:
+                    continue
+                if isinstance(event, FeedFailure):
+                    raise RuntimeError("Market-data feed failed") from event.error
+                self._process_quote(event)
         finally:
-            self.order_executor.disconnect()
+            self._stop_event.set()
+            try:
+                feed.stop()
+            finally:
+                try:
+                    if live_broker is not None:
+                        live_broker.disconnect()
+                finally:
+                    self._restore_shutdown_handlers(previous_handlers)
+                    logger.info("arbitrage_engine_stopped")
+
+    def _receive_quote(self, quote: MarketQuote) -> None:
+        """Persist a validated quote in the callback, then publish it to the queue."""
+        try:
+            self._journal.record_quote(quote)
+            self._events.put_nowait(quote)
+        except Exception as exc:
+            logger.exception("arbitrage_quote_ingress_failed", symbol=quote.symbol)
+            self._events.put_nowait(FeedFailure(exc))
+
+    def _receive_feed_failure(self, error: Exception) -> None:
+        self._events.put_nowait(FeedFailure(error))
+
+    def _process_quote(self, quote: MarketQuote) -> None:
+        opportunity = self._engine.update_quote(quote)
+        if opportunity is None:
+            return
+
+        decision = self._risk.validate(opportunity)
+        self._journal.record_opportunity(opportunity, decision)
+        logger.info(
+            "arbitrage_opportunity_detected",
+            opportunity_id=opportunity.opportunity_id,
+            symbol=opportunity.symbol,
+            buy_exchange=opportunity.buy_exchange,
+            sell_exchange=opportunity.sell_exchange,
+            estimated_net_profit=str(opportunity.estimated_net_profit),
+            risk_approved=decision.approved,
+        )
+        if not decision.approved:
+            return
+
+        current_quotes = self._engine.latest_quotes[opportunity.symbol]
+        if self._settings.live_trading_enabled:
+            if self._live_executor is None or self._catalog is None:
+                raise RuntimeError("Live execution was enabled without initialized broker components")
+            instruments = self._catalog.by_name[opportunity.symbol]
+            report = self._live_executor.execute(
+                opportunity,
+                instruments[opportunity.buy_exchange],
+                instruments[opportunity.sell_exchange],
+            )
+            if report.open_quantity or report.status == "MANUAL_RECONCILIATION":
+                self._stop_event.set()
+                raise RuntimeError(
+                    f"Live execution needs manual reconciliation: {report.opportunity_id}"
+                )
+            logger.info(
+                "live_arbitrage_execution_recorded",
+                opportunity_id=report.opportunity_id,
+                status=report.status,
+                estimated_net_pnl=str(report.estimated_net_pnl),
+            )
+            return
+
+        execution = self._paper_executor.execute(
+            opportunity,
+            current_quotes,
+            datetime.now(timezone.utc),
+        )
+        self._journal.record_execution(execution)
+        self._risk.record_realized_pnl(execution.net_profit)
+        if execution.open_quantity:
+            self._risk.engage_kill_switch("paper fallback left an unhedged quantity")
+            logger.error(
+                "paper_position_unhedged",
+                opportunity_id=opportunity.opportunity_id,
+                symbol=opportunity.symbol,
+                open_quantity=execution.open_quantity,
+            )
+        else:
+            logger.info(
+                "paper_execution_recorded",
+                execution_id=execution.execution_id,
+                status=execution.status,
+                fallback_used=execution.fallback_used,
+                net_profit=str(execution.net_profit),
+            )
+
+    def _install_shutdown_handlers(self) -> dict[int, object]:
+        previous: dict[int, object] = {}
+
+        def request_shutdown(_signum: int, _frame: object) -> None:
+            logger.info("arbitrage_shutdown_requested")
+            self._stop_event.set()
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, request_shutdown)
+        return previous
+
+    @staticmethod
+    def _restore_shutdown_handlers(previous: dict[int, object]) -> None:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)  # type: ignore[arg-type]
 
 
-def main() -> None:
-    ArbitrageWatcher().run()
+def main() -> NoReturn:
+    ArbitrageApplication().run()
+    raise SystemExit(0)

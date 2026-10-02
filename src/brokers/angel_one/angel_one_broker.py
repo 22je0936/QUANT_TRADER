@@ -9,6 +9,7 @@ runtime; imported lazily so the rest of the app works without it installed
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -68,6 +69,7 @@ class AngelOneBrokerAdapter(IBrokerGateway):
         self._password = password
         self._totp_secret = totp_secret
         self._client: Any = None
+        self._orders_by_client_id: dict[str, Order] = {}
 
     def connect(self) -> None:
         try:
@@ -113,12 +115,17 @@ class AngelOneBrokerAdapter(IBrokerGateway):
 
     def place_order(self, order: Order) -> Order:
         self._require_connected()
+        if order.exchange is None or not order.trading_symbol or not order.symbol_token:
+            raise OrderRejectedError(
+                "Angel One orders require exchange, trading_symbol, and symbol_token"
+            )
+
         params = {
             "variety": "NORMAL",
-            "tradingsymbol": order.instrument_id,
-            "symboltoken": order.instrument_id,
+            "tradingsymbol": order.trading_symbol,
+            "symboltoken": order.symbol_token,
             "transactiontype": _TRANSACTION_TYPE_MAP[order.transaction_type],
-            "exchange": "NSE",
+            "exchange": order.exchange.value,
             "ordertype": _ORDER_TYPE_MAP[order.order_type],
             "producttype": order.product_type.value,
             "duration": "DAY",
@@ -130,25 +137,148 @@ class AngelOneBrokerAdapter(IBrokerGateway):
             params["triggerprice"] = str(order.trigger_price)
 
         try:
-            response = self._client.placeOrder(params)
+            response = self._client.placeOrderFullResponse(params)
         except Exception as exc:  # noqa: BLE001
             raise OrderRejectedError(str(exc)) from exc
 
-        order.broker_order_id = str(response)
+        if not isinstance(response, dict) or not response.get("status"):
+            message = (
+                response.get("message", "Angel One rejected the order")
+                if isinstance(response, dict)
+                else "Invalid order response"
+            )
+            raise OrderRejectedError(str(message))
+        data = response.get("data") or {}
+        broker_order_id = data.get("orderid") if isinstance(data, dict) else None
+        if not broker_order_id:
+            raise OrderRejectedError("Angel One order response did not contain an order ID")
+
+        order.broker_order_id = str(broker_order_id)
         order.status = OrderStatus.OPEN
+        self._orders_by_client_id[order.client_order_id] = order
         return order
 
     def modify_order(self, client_order_id: str, **changes: object) -> Order:
         self._require_connected()
-        raise NotImplementedError("Wire up SmartConnect.modifyOrder with broker_order_id lookup")
+        order = self._get_tracked_order(client_order_id)
+        if order.exchange is None:
+            raise OrderRejectedError("Tracked order has no exchange")
+        price = changes.get("price", order.price)
+        params = {
+            "variety": "NORMAL",
+            "orderid": order.broker_order_id,
+            "ordertype": _ORDER_TYPE_MAP[order.order_type],
+            "producttype": order.product_type.value,
+            "duration": "DAY",
+            "price": str(price) if price is not None else None,
+            "quantity": str(changes.get("quantity", order.quantity)),
+            "tradingsymbol": order.trading_symbol,
+            "symboltoken": order.symbol_token,
+            "exchange": order.exchange.value,
+        }
+        response = self._client.modifyOrder(params)
+        if not isinstance(response, dict) or not response.get("status"):
+            message = (
+                response.get("message", "Angel One rejected the order modification")
+                if isinstance(response, dict)
+                else "Invalid modify response"
+            )
+            raise OrderRejectedError(str(message))
+        if "quantity" in changes:
+            order.quantity = int(changes["quantity"])
+        if "price" in changes:
+            order.price = Decimal(str(changes["price"]))
+        return self.get_order_status(client_order_id)
 
     def cancel_order(self, client_order_id: str) -> Order:
         self._require_connected()
-        raise NotImplementedError("Wire up SmartConnect.cancelOrder with broker_order_id lookup")
+        order = self._get_tracked_order(client_order_id)
+        response = self._client.cancelOrder(order.broker_order_id, "NORMAL")
+        if not isinstance(response, dict) or not response.get("status"):
+            message = (
+                response.get("message", "Angel One rejected the cancellation")
+                if isinstance(response, dict)
+                else "Invalid cancel response"
+            )
+            raise OrderRejectedError(str(message))
+        return self.get_order_status(client_order_id)
 
     def get_order_status(self, client_order_id: str) -> Order:
         self._require_connected()
-        raise NotImplementedError("Wire up SmartConnect.orderBook lookup by client_order_id")
+        order = self._get_tracked_order(client_order_id)
+        response = self._client.orderBook()
+        if not isinstance(response, dict) or not response.get("status"):
+            message = (
+                response.get("message", "Angel One order-book request failed")
+                if isinstance(response, dict)
+                else "Invalid order-book response"
+            )
+            raise BrokerConnectionError(str(message))
+        orders = response.get("data") or []
+        row = next(
+            (
+                item
+                for item in orders
+                if isinstance(item, dict)
+                and str(item.get("orderid", "")) == order.broker_order_id
+            ),
+            None,
+        )
+        if row is None:
+            raise BrokerConnectionError(
+                f"Broker order {order.broker_order_id} is missing from the order book"
+            )
+
+        raw_status = str(row.get("orderstatus", row.get("status", "")))
+        order.status = self._map_order_status(raw_status)
+        order.filled_quantity = int(row.get("filledshares", row.get("filledquantity", 0)) or 0)
+        average_price = row.get("averageprice", row.get("avgprice"))
+        order.average_price = (
+            Decimal(str(average_price)) if average_price not in (None, "") else None
+        )
+        order.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        return order
+
+    def get_open_orders(self) -> list[dict[str, Any]]:
+        """Return broker orders not in a known terminal state for startup preflight."""
+        self._require_connected()
+        response = self._client.orderBook()
+        if not isinstance(response, dict) or not response.get("status"):
+            message = (
+                response.get("message", "Angel One order-book request failed")
+                if isinstance(response, dict)
+                else "Invalid order-book response"
+            )
+            raise BrokerConnectionError(str(message))
+        rows = response.get("data") or []
+        if not isinstance(rows, list):
+            raise BrokerConnectionError("Angel One order book returned an invalid data field")
+        return [
+            row
+            for row in rows
+            if isinstance(row, dict)
+            and self._map_order_status(str(row.get("orderstatus", row.get("status", ""))))
+            not in {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED}
+        ]
+
+    def _get_tracked_order(self, client_order_id: str) -> Order:
+        order = self._orders_by_client_id.get(client_order_id)
+        if order is None or order.broker_order_id is None:
+            raise OrderRejectedError(f"Unknown client_order_id: {client_order_id}")
+        return order
+
+    @staticmethod
+    def _map_order_status(status: str) -> OrderStatus:
+        normalized = status.strip().lower().replace("_", " ")
+        if normalized in {"complete", "completed", "filled"}:
+            return OrderStatus.FILLED
+        if normalized in {"partially filled", "partial fill"}:
+            return OrderStatus.PARTIALLY_FILLED
+        if normalized in {"cancelled", "canceled"}:
+            return OrderStatus.CANCELLED
+        if normalized in {"rejected", "failed"}:
+            return OrderStatus.REJECTED
+        return OrderStatus.OPEN
 
     def get_positions(self) -> list[Position]:
         self._require_connected()

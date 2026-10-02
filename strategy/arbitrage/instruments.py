@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
-from src.core.arbitrage_config import EXCHANGES, EXCH_TYPE
+EXCHANGES = ("NSE", "BSE")
 
 
 @dataclass(frozen=True)
@@ -15,12 +16,13 @@ class Instrument:
     exchange: str
     symbol: str
     token: str
+    tick_size: Decimal = Decimal("0.05")
 
 
 @dataclass(frozen=True)
 class InstrumentCatalog:
     by_name: dict[str, dict[str, Instrument]]
-    by_token: dict[tuple[int, str], tuple[str, str]]
+    by_token: dict[tuple[str, str], tuple[str, str]]
     missing_names: tuple[str, ...]
 
 
@@ -41,7 +43,7 @@ def load_instruments(scrip_file: Path, watchlist: tuple[str, ...]) -> Instrument
             by_exchange[exchange].setdefault(str(row.get("name", "")).upper(), row)
 
     by_name: dict[str, dict[str, Instrument]] = {}
-    by_token: dict[tuple[int, str], tuple[str, str]] = {}
+    by_token: dict[tuple[str, str], tuple[str, str]] = {}
     missing_names: list[str] = []
 
     for name in watchlist:
@@ -58,12 +60,13 @@ def load_instruments(scrip_file: Path, watchlist: tuple[str, ...]) -> Instrument
                 exchange=exchange,
                 symbol=str(row["symbol"]),
                 token=str(row["token"]),
+                tick_size=Decimal(str(row.get("tick_size", "5"))) / Decimal(100),
             )
             for exchange, row in exchange_rows.items()
             if row is not None
         }
         by_name[name] = instruments
         for exchange, instrument in instruments.items():
-            by_token[(EXCH_TYPE[exchange], instrument.token)] = (name, exchange)
+            by_token[(exchange, instrument.token)] = (name, exchange)
 
     return InstrumentCatalog(by_name, by_token, tuple(missing_names))

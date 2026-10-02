@@ -22,6 +22,10 @@ Requires-Dist: cryptography>=42.0
 Requires-Dist: httpx>=0.27
 Requires-Dist: websocket-client>=1.7
 Requires-Dist: tenacity>=8.2
+Provides-Extra: angel-one
+Requires-Dist: smartapi-python>=1.5.5; extra == "angel-one"
+Requires-Dist: pyotp>=2.9; extra == "angel-one"
+Requires-Dist: logzero>=1.7; extra == "angel-one"
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0; extra == "dev"
 Requires-Dist: pytest-asyncio>=0.23; extra == "dev"
