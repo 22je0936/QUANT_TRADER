@@ -3,18 +3,19 @@ from __future__ import annotations
 
 from functools import lru_cache
 from decimal import Decimal
-from typing import Literal
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=Path(__file__).resolve().parents[2] / ".env",
+        extra="ignore",
+    )
 
     app_env: str = "development"
     log_level: str = "INFO"
-
-    broker_provider: Literal["paper", "angel_one", "kite"] = "paper"
 
     # Angel One
     angel_one_api_key: str = ""
@@ -22,33 +23,19 @@ class Settings(BaseSettings):
     angel_one_password: str = ""
     angel_one_totp_secret: str = ""
 
-    # Arbitrage guardrails. Live execution is intentionally unsupported for now.
+    # Live arbitrage guardrails.
     live_trading_enabled: bool = False
     live_trading_acknowledgement: str = ""
     arbitrage_max_exposure_inr: Decimal = Decimal("300")
     arbitrage_max_daily_loss_inr: Decimal = Decimal("60")
     arbitrage_max_fallback_loss_inr: Decimal = Decimal("30")
 
-    # Kite
-    kite_api_key: str = ""
-    kite_api_secret: str = ""
-    kite_access_token: str = ""
+    # FUTURE-ONLY INFRASTRUCTURE
+    # Postgres / ClickHouse are intentionally not active in the default arbitrage runtime.
+    # These values are kept only as placeholders for possible future analytics or storage layers.
+    # Do not treat them as required services for the current live arbitrage workflow.
 
-    # PostgreSQL
-    postgres_host: str = "localhost"
-    postgres_port: int = 5432
-    postgres_db: str = "quant_trader"
-    postgres_user: str = "quant_trader"
-    postgres_password: str = "change_me"
-
-    # ClickHouse
-    clickhouse_host: str = "localhost"
-    clickhouse_port: int = 8123
-    clickhouse_db: str = "quant_trader"
-    clickhouse_user: str = "default"
-    clickhouse_password: str = "change_me"
-
-    # Redis
+    # Redis (optional cache/state placeholder; not required for current arbitrage flow)
     redis_host: str = "localhost"
     redis_port: int = 6379
     redis_db: int = 0
@@ -63,13 +50,6 @@ class Settings(BaseSettings):
     max_daily_loss: float = 25000
     max_position_size: float = 100000
     max_order_quantity: int = 1000
-
-    @property
-    def postgres_dsn(self) -> str:
-        return (
-            f"postgresql+psycopg2://{self.postgres_user}:{self.postgres_password}"
-            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
-        )
 
     @property
     def redis_url(self) -> str:

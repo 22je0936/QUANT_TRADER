@@ -1,17 +1,13 @@
 [project]
 name = "quant-trader"
 version = "0.1.0"
-description = "Broker-agnostic quantitative trading engine (Angel One -> Kite)"
+description = "Angel One quantitative trading tools for Indian markets"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
-    "sqlalchemy>=2.0",
-    "alembic>=1.13",
-    "psycopg2-binary>=2.9",
-    "clickhouse-connect>=0.7",
     "redis>=5.0",
     "numpy>=1.26",
     "pandas>=2.2",

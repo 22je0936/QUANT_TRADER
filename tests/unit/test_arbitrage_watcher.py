@@ -89,6 +89,31 @@ def test_engine_detects_bid_ask_opportunity_after_costs():
     assert opportunity.estimated_net_profit < opportunity.gross_profit
 
 
+def test_minimum_net_profit_threshold_is_inclusive_and_applied_before_risk_approval():
+    now = datetime(2026, 10, 2, 10, 0, tzinfo=timezone.utc)
+    baseline = _opportunity()[2]
+    minimum_profit = baseline.estimated_net_profit
+
+    qualifying_config = _config(min_net_profit=minimum_profit)
+    qualifying_engine = ArbitrageEngine(qualifying_config, CostCalculator())
+    qualifying_engine.update_quote(_quote("NSE", now), now)
+    qualifying_opportunity = qualifying_engine.update_quote(
+        _quote("BSE", now, bid="103", ask="104"), now
+    )
+
+    assert qualifying_opportunity is not None
+    assert qualifying_opportunity.estimated_net_profit == minimum_profit
+    assert OpportunityRiskManager(qualifying_config).validate(qualifying_opportunity).approved
+
+    rejecting_engine = ArbitrageEngine(
+        _config(min_net_profit=minimum_profit + Decimal("0.01")), CostCalculator()
+    )
+    rejecting_engine.update_quote(_quote("NSE", now), now)
+    assert rejecting_engine.update_quote(
+        _quote("BSE", now, bid="103", ask="104"), now
+    ) is None
+
+
 def test_market_quote_rejects_naive_timestamps_and_invalid_prices():
     with pytest.raises(ValueError, match="timezone"):
         _quote("NSE", datetime(2026, 10, 2, 10, 0))

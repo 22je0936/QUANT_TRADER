@@ -1,6 +1,6 @@
 """Ports (interfaces). Core/service/strategy code depends only on these — never on
 concrete broker SDKs or database drivers. Every adapter/repository implements one
-of these ABCs so implementations are interchangeable (Angel One <-> Kite <-> Paper).
+of these ABCs. Angel One is the live broker; backtesting uses a separate local fill model.
 """
 from __future__ import annotations
 
